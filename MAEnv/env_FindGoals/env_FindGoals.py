@@ -256,6 +256,8 @@ class EnvFindGoals(object):
                 self.occupancy[self.agt1_pos[0]][self.agt1_pos[1]] = 1
             else:
                 reward_1 = reward_1 - 3
+        elif action_list[0] == 4:  # wait
+            reward_1 = reward_1 - 1
 
         # agent2 move
         if action_list[1] == 0:    # move up
@@ -304,7 +306,7 @@ class EnvFindGoals(object):
             reward_2 = reward_2 + 50
 
         done = False
-        if reward_1>0 or reward_2>0:
+        if reward_1>0:
             done = True
         return [reward_1, reward_2], done
 

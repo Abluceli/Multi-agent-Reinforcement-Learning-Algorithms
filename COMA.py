@@ -1,224 +1,179 @@
-from torch.distributions.categorical import Categorical
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
+import tensorflow as tf
+from tensorflow.keras.layers import Conv2D, GRU, Dense, Flatten, Input, Dense, Concatenate
+import numpy as np
+import random
+from collections import deque
+from tensorflow.keras.models import Model
+
+
+def Actor_network(obs_shape, num_agents, action_shape):
+    obs = Input(shape=obs_shape)
+    agent_onhot = Input(shape=num_agents)
+    old_action = Input(shape=action_shape)
+    input_embeding = Dense(32, activation="relu")(tf.concat((obs, agent_onhot, old_action), axis=-1))
+    h = GRU(units=16, activation="relu", return_sequences=False)(input_embeding)
+    pi = Dense(action_shape, activation="softmax")(h)
+    model = Model(inputs=[obs, agent_onhot, old_action], outputs=pi)
+    return model
+
+def Critic_network(obs_shape, action_shape, num_agents, state_shape):
+    obs = Input(shape=obs_shape)
+    state = Input(shape=state_shape)
+    agent_onhot = Input(shape=num_agents)
+    old_actions = Input(shape=action_shape*num_agents)
+    current_actions_without_agent = Input(shape=action_shape * (num_agents-1))
+    input_embeding = Dense(32, activation="relu")(tf.concat((current_actions_without_agent, state, obs, agent_onhot, old_actions), axis=-1))
+    q = Dense(action_shape)(input_embeding)
+    model = Model(inputs=[current_actions_without_agent, state, obs, agent_onhot, old_actions], outputs=q)
+    return model
+
+class COMA():
+    def __init__(self, n_actions, n_agents, state_shape, obs_shape):
+        self.n_actions = n_actions
+        self.n_agents = n_agents
+        self.state_shape = state_shape
+        self.obs_shape = obs_shape
+        self.eval_policy = Actor_network(obs_shape=obs_shape, num_agents=n_agents, action_shape=n_actions)
+        # 得到当前agent的所有可执行动作对应的联合Q值，得到之后需要用该Q值和actor网络输出的概率计算advantage
+        self.eval_critic = Critic_network(obs_shape=obs_shape, action_shape=n_actions, num_agents=n_agents, state_shape=state_shape)
+        self.target_critic = Critic_network(obs_shape=obs_shape, action_shape=n_actions, num_agents=n_agents, state_shape=state_shape)
+
+        self.target_critic.set_weights(self.eval_critic.get_weights())
+
+        self.eval_policy_optimizer = tf.keras.optimizers.RMSprop(learning_rate=5e-4)
+        self.eval_critic_optimizer = tf.keras.optimizers.RMSprop(learning_rate=5e-4)
+
+    def choose_action(self, obs, last_action, agent_num, epsilon, evaluate=False):
+        # 传入的agent_num是一个整数，代表第几个agent，现在要把他变成一个onehot向量
+        agent_onehot = np.zeros(self.n_agents)
+        agent_onehot[agent_num] = 1.
+
+        obs = tf.convert_to_tensor(obs, dtype=tf.float32)
+        agent_onehot = tf.convert_to_tensor(agent_onehot, dtype=tf.float32)
+        last_action = tf.convert_to_tensor(last_action, dtype=tf.float32)
+
+        pi = self.eval_policy.predict([obs, agent_onehot, last_action])
+        if evaluate:
+            action = tf.argmax(pi[0])
+        else:
+            if np.random.rand(1) >= epsilon:  # epslion greedy
+                action = np.random.randint(0, self.n_actions)
+            else:
+                action = tf.argmax(pi[0])
+        return action
+
+
+    def learn(self, batch, max_episode_len, train_step, epsilon=0.9):  # train_step表示是第几次学习，用来控制更新target_net网络的参数
+        # bacth中的每一项(n_episodes, episode_len, n_agents, 具体维度)
+        # 我们采用最简化设计，n_episodes = 1， 即只采一轮数据就进行训练
+        for key in batch.keys():  # 把batch里的数据转化成tensor
+            if key == 'u':
+                batch[key] = tf.convert_to_tensor(batch[key], dtype=tf.int32)
+            else:
+                batch[key] = tf.convert_to_tensor(batch[key], dtype=tf.float32)
+        u, r, terminated = batch['u'], batch['r'], batch['terminated']
+        mask = (1 - batch["padded"].float()).repeat(1, 1, self.n_agents)  # 用来把那些填充的经验的TD-error置0，从而不让它们影响到学习
+        if self.args.cuda:
+            u = u.cuda()
+            mask = mask.cuda()
+        # 根据经验计算每个agent的Ｑ值,从而跟新Critic网络。然后计算各个动作执行的概率，从而计算advantage去更新Actor。
+        q_values = self._train_critic(batch, max_episode_len, train_step)  # 训练critic网络，并且得到每个agent的所有动作的Ｑ值
+        action_prob = self._get_action_prob(batch, max_episode_len, epsilon)  # 每个agent的所有动作的概率
+
+        q_taken = torch.gather(q_values, dim=3, index=u).squeeze(3)  # 每个agent的选择的动作对应的Ｑ值
+        pi_taken = torch.gather(action_prob, dim=3, index=u).squeeze(3)  # 每个agent的选择的动作对应的概率
+        pi_taken[mask == 0] = 1.0  # 因为要取对数，对于那些填充的经验，所有概率都为0，取了log就是负无穷了，所以让它们变成1
+        log_pi_taken = torch.log(pi_taken)
+
+
+        # 计算advantage
+        baseline = (q_values * action_prob).sum(dim=3, keepdim=True).squeeze(3).detach()
+        advantage = (q_taken - baseline).detach()
+        loss = - ((advantage * log_pi_taken) * mask).sum() / mask.sum()
+        self.rnn_optimizer.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.rnn_parameters, self.args.grad_norm_clip)
+        self.rnn_optimizer.step()
+
+
 from MAEnv.env_FindGoals.env_FindGoals import EnvFindGoals
-import matplotlib.pyplot as plt
-
-class Flatten(nn.Module):
-    def forward(self, input):
-        return input.view(input.size(0), -1)
-
-class Actor(nn.Module):
-    def __init__(self, N_action):
-        super(Actor, self).__init__()
-        self.N_action = N_action
-        self.conv1 = nn.Conv2d(in_channels=3, out_channels=16, kernel_size=3, stride=1)
-        self.flat1 = Flatten()
-        self.fc1 = nn.Linear(16, 32)
-        self.rnn = nn.GRUCell(32, 32)
-        self.fc2 = nn.Linear(32, self.N_action)
-
-    def init_hidden(self):
-        # make hidden states on same device as model
-        return self.fc1.weight.new(1, 32).zero_()
-
-    def get_action(self, obs, agent_one_hot, old_action, hidden_state):
-        h1 = F.relu(self.conv1(obs))
-        h1 = self.flat1(h1)
-        h1 = F.relu(self.fc1(h1))
-        h_in = hidden_state.reshape(-1, 32)
-        h = self.rnn(h1, h_in)
-        q = F.softmax(self.fc2(h), dim=1)
-        m = Categorical(q.squeeze(0))
-        return m.sample().item(), h
-
-
-class Critic(nn.Module):
-    def __init__(self, N_action):
-        super(Critic, self).__init__()
-        self.N_action = N_action
-        self.conv1 = nn.Conv2d(in_channels=3, out_channels=16, kernel_size=3, stride=1)
-        self.flat1 = Flatten()
-        self.conv2 = nn.Conv2d(in_channels=3, out_channels=16, kernel_size=3, stride=1)
-        self.flat2 = Flatten()
-        self.fc1 = nn.Linear(32, 64)
-        self.fc2 = nn.Linear(64, N_action*N_action)
-
-    def get_value(self, s1, s2):
-        h1 = F.relu(self.conv1(s1))
-        h1 = self.flat1(h1)
-        h2 = F.relu(self.conv2(s2))
-        h2 = self.flat2(h2)
-        h = torch.cat([h1, h2], 1)
-        x = F.relu(self.fc1(h))
-        x = self.fc2(x)
-        return x
-
-class COMA(object):
-    def __init__(self, N_action):
-        self.N_action = N_action
-        self.actor1 = Actor(self.N_action)
-        self.actor2 = Actor(self.N_action)
-        self.critic = Critic(self.N_action)
-        self.gamma = 0.95
-        self.c_loss_fn = torch.nn.MSELoss()
-    def save_model(self):
-        torch.save(self.actor1.state_dict(), './model/actor1.pkl')
-        torch.save(self.actor2.state_dict(), './model/actor2.pkl')
-        torch.save(self.critic.state_dict(), './model/critic.pkl')
-    def load_model(self):
-        self.actor1.load_state_dict(torch.load('./model/actor1.pkl'))
-        self.actor2.load_state_dict(torch.load('./model/actor2.pkl'))
-        self.critic.load_state_dict(torch.load('./model/critic.pkl'))
-
-    def get_action(self, obs1, obs2):
-        action1, pi_a1 = self.actor1.get_action(self.img_to_tensor(obs1).unsqueeze(0))
-        action2, pi_a2 = self.actor2.get_action(self.img_to_tensor(obs2).unsqueeze(0))
-        return action1, pi_a1, action2, pi_a2
-
-    def img_to_tensor(self, img):
-        img_tensor = torch.FloatTensor(img)
-        img_tensor = img_tensor.permute(2, 0, 1)
-        return img_tensor
-
-    def cross_prod(self, pi_a1, pi_a2):
-        new_pi = torch.zeros(1, self.N_action*self.N_action)
-        for i in range(self.N_action):
-            for j in range(self.N_action):
-                new_pi[0, i*self.N_action+j] = pi_a1[0, i]*pi_a2[0, j]
-        return new_pi
-
-    def train(self, o1_list, a1_list, pi_a1_list, o2_list, a2_list, pi_a2_list, r_list):
-        a1_optimizer = torch.optim.Adam(self.actor1.parameters(), lr=3e-4)
-        a2_optimizer = torch.optim.Adam(self.actor2.parameters(), lr=3e-4)
-        c_optimizer = torch.optim.Adam(self.critic.parameters(), lr=1e-3)
-
-        T = len(r_list)
-        obs1 = self.img_to_tensor(o1_list[0]).unsqueeze(0)
-        obs2 = self.img_to_tensor(o2_list[0]).unsqueeze(0)
-        for t in range(1, T):
-            temp_obs1 = self.img_to_tensor(o1_list[t]).unsqueeze(0)
-            obs1 = torch.cat([obs1, temp_obs1], dim=0)
-            temp_obs2 = self.img_to_tensor(o2_list[t]).unsqueeze(0)
-            obs2 = torch.cat([obs2, temp_obs2], dim=0)
-
-        Q = self.critic.get_value(obs1, obs2)
-        Q_est = Q.clone()
-        for t in range(T - 1):
-            a_index = a1_list[t]*self.N_action + a2_list[t]
-            Q_est[t][a_index] = r_list[t] + self.gamma * torch.sum(self.cross_prod(pi_a1_list[t+1], pi_a2_list[t+1])*Q_est[t+1, :])
-        a_index = a1_list[T - 1] * self.N_action + a2_list[T - 1]
-        Q_est[T - 1][a_index] = r_list[T - 1]
-        c_loss = self.c_loss_fn(Q, Q_est.detach())
-        c_optimizer.zero_grad()
-        c_loss.backward()
-        c_optimizer.step()
-
-        A1_list = []
-        for t in range(T):
-            temp_Q1 = torch.zeros(1, self.N_action)
-            for a1 in range(self.N_action):
-                temp_Q1[0, a1] = Q[t][a1*self.N_action + a2_list[t]]
-            a_index = a1_list[t] * self.N_action + a2_list[t]
-            temp_A1 = Q[t, a_index] - torch.sum(pi_a1_list[t]*temp_Q1)
-            A1_list.append(temp_A1)
-
-        A2_list = []
-        for t in range(T):
-            temp_Q2 = torch.zeros(1, self.N_action)
-            for a2 in range(self.N_action):
-                temp_Q2[0, a2] = Q[t][a1_list[t] * self.N_action + a2]
-            a_index = a1_list[t] * self.N_action + a2_list[t]
-            temp_A2 = Q[t, a_index] - torch.sum(pi_a2_list[t] * temp_Q2)
-            A2_list.append(temp_A2)
-
-        a1_loss = torch.FloatTensor([0.0])
-        for t in range(T):
-            a1_loss = a1_loss + A1_list[t].item() * torch.log(pi_a1_list[t][0, a1_list[t]])
-        a1_loss = -a1_loss / T
-        a1_optimizer.zero_grad()
-        a1_loss.backward()
-        a1_optimizer.step()
-
-        a2_loss = torch.FloatTensor([0.0])
-        for t in range(T):
-            a2_loss = a2_loss + A2_list[t].item() * torch.log(pi_a2_list[t][0, a2_list[t]])
-        a2_loss = -a2_loss / T
-        a2_optimizer.zero_grad()
-        a2_loss.backward()
-        a2_optimizer.step()
-
-def train_model(max_epi_iter):
-    torch.set_num_threads(1)
+def run():
+    train_steps = 0
+    n_epoch = 1000
+    n_episodes = 1
+    max_episode_len = 200
     env = EnvFindGoals()
-    max_epi_iter = max_epi_iter
-    max_MC_iter = 1000
-    agent = COMA(N_action=5)
-    train_curve = []
-    for epi_iter in range(max_epi_iter):
-        env.reset()
-        o1_list = []
-        a1_list = []
-        pi_a1_list = []
-        o2_list = []
-        a2_list = []
-        pi_a2_list = []
-        r_list = []
-        acc_r = 0
-        for MC_iter in range(max_MC_iter):
-            # env.render()
-            obs1 = env.get_agt1_obs()
-            obs2 = env.get_agt2_obs()
-            o1_list.append(obs1)
-            o2_list.append(obs2)
-            action1, pi_a1, action2, pi_a2 = agent.get_action(obs1, obs2)
-            a1_list.append(action1)
-            pi_a1_list.append(pi_a1)
-            a2_list.append(action2)
-            pi_a2_list.append(pi_a2)
-            reward, done = env.step([action1, action2])
-            acc_r = acc_r + reward[0] + reward[1]
-            r_list.append(reward[0] + reward[1])
-            if done:
-                break
+    agents = COMA(n_actions=5, n_agents=2, state_shape=4*10*3, obs_shape=3*3*3)
+    for epoch in range(n_epoch):
+        episodes = []
+        # 收集self.args.n_episodes个episodes
+        for episode_idx in range(n_episodes):
+            observations, actions_, rewards, states, actions_onehots, dones = [], [], [], [], [], []
+            step = 0
+            episode_reward = 0
+            last_action = np.zeros((2, 5))
+            for i in range(max_episode_len):
+                obs = [env.get_agt1_obs().reshape(1,-1)[0], env.get_agt2_obs().reshape(1,-1)[0]]
+                state = env.get_full_obs().reshape(1,-1)[0]
+                actions, actions_onehot = [], []
+                for agent_id in range(2): #n_agents
+                    # 输入当前agent上一个时刻的动作
+                    action = agents.choose_action(obs[agent_id], last_action[agent_id],
+                                                  agent_id, epsilon=0.9, evaluate=False)
+                    # 生成对应动作的0 1向量
+                    action_onehot = np.zeros(5)#n_actions
+                    action_onehot[action] = 1
+                    actions.append(action)
+                    actions_onehot.append(action_onehot)
+                    last_action[agent_id] = action_onehot
 
-        train_curve.append(acc_r)
-        print('Episode', epi_iter, 'reward', acc_r)
-        agent.train(o1_list, a1_list, pi_a1_list, o2_list, a2_list, pi_a2_list, r_list)
-    agent.save_model()
-    plt.plot(train_curve, linewidth=1, label='COMA')
-    plt.show()
+                reward, done = env.step(actions)
 
+                observations.append(obs)
+                states.append(state)
+                actions_.append(np.reshape(actions, [2, 1]))#[n_agents, 1]
+                actions_onehots.append(actions_onehot)
+                rewards.append([reward])
 
-import time
-def run(max_epi_iter):
-    env = EnvFindGoals()
-    max_epi_iter = max_epi_iter
-    max_MC_iter = 1000
-    agent = COMA(N_action=5)
-    agent.load_model()
-    for epi_iter in range(max_epi_iter):
-        env.reset()
-        acc_r = 0
-        for MC_iter in range(max_MC_iter):
-            env.render()
-            time.sleep(0.5)
-            obs1 = env.get_agt1_obs()
-            obs2 = env.get_agt2_obs()
+                episode_reward += reward
+                step += 1
+                if done or step == max_episode_len - 1:
+                    dones.append([1])
+                else:
+                    dones.append([0])
+            # 处理最后一个obs
+            observations.append(obs)
+            states.append(state)
+            observations_next = observations[1:]
+            states_next = states[1:]
+            observations = observations[:-1]
+            states = states[:-1]
 
-            action1, pi_a1, action2, pi_a2 = agent.get_action(obs1, obs2)
+            episode = dict(o=observations.copy(),
+                           s=states.copy(),
+                           u=actions_.copy(),
+                           r=rewards.copy(),
 
-            reward, done = env.step([action1, action2])
+                           o_next=observations_next.copy(),
+                           s_next=states_next.copy(),
 
-            acc_r = acc_r + reward[0] + reward[1]
+                           u_onehot=actions_onehots.copy(),
 
-            if done:
-                break
+                           terminated=dones.copy()
+                           )
+            for key in episode.keys():
+                episode[key] = np.array([episode[key]])
+            episodes.append(episode)
 
-        print('Episode', epi_iter, 'reward', acc_r)
-
-
-if __name__ == '__main__':
-    #train_model(max_epi_iter=2000)
-    run(max_epi_iter=1000)
+        # episode的每一项都是一个(1, episode_len, n_agents, 具体维度)四维数组，下面要把所有episode的的obs,action等信息拼在一起
+        episode_batch = episodes[0]
+        episodes.pop(0)
+        for episode in episodes:
+            for key in episode_batch.keys():
+                episode_batch[key] = np.concatenate((episode_batch[key], episode[key]), axis=0)
+        #episode_bacth中的每一项(n_episodes, episode_len, n_agents, 具体维度)
+        #我们采用最简化设计，n_episodes = 1， 即只采一轮数据就进行训练
+        terminated = episode_batch['terminated']
+        max_episode_len = terminated.shape[1]
+        agents.learn(batch=episode_batch, max_episode_len=max_episode_len, train_step=train_steps, epsilon=0.9)
+        train_steps += 1
