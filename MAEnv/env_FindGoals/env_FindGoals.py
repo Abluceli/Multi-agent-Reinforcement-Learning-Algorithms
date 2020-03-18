@@ -308,7 +308,7 @@ class EnvFindGoals(object):
         done = False
         if reward_1>0:
             done = True
-        return [reward_1, reward_2], done
+        return reward_1 + reward_2, done
 
     def reset(self):
         self.agt1_pos = [3, 1]
