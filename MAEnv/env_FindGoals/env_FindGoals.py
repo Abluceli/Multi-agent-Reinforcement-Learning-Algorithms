@@ -292,7 +292,7 @@ class EnvFindGoals(object):
                 self.occupancy[self.agt2_pos[0]][self.agt2_pos[1]] = 1
             else:
                 reward_2 = reward_2 - 3
-
+        done = False
         if self.agt1_pos == self.dest1:
             self.occupancy[self.agt1_pos[0]][self.agt1_pos[1]] = 0
             self.agt1_pos = self.start1
@@ -305,9 +305,11 @@ class EnvFindGoals(object):
             self.occupancy[self.agt2_pos[0]][self.agt2_pos[1]] = 1
             reward_2 = reward_2 + 50
 
-        done = False
-        if reward_1>0:
+        if self.agt1_pos == self.dest1 and self.agt2_pos == self.dest2:
             done = True
+
+        #if reward_1>0:
+        #    done = True
         return reward_1 + reward_2, done
 
     def reset(self):
